@@ -1,0 +1,35 @@
+# Local .terraform directories (providers y modulos descargados)
+**/.terraform/*
+
+# State files: pueden tener secretos (ver 04-01 v4) -> NUNCA a git
+*.tfstate
+*.tfstate.*
+terraform.tfstate.d/
+
+# Planes guardados (binarios, pueden tener secretos)
+*.tfplan
+*.plan
+*.out
+tfplan
+plan.txt
+
+# Crash log files
+crash.log
+crash.*.log
+
+# Variables con secretos (se sube solo el .example)
+secrets.tfvars
+*.secret.tfvars
+
+# Claves SSH (en el lab original el .pem estaba versionado: mala practica)
+*.pem
+private-key/
+
+# Salidas de los local-exec de 08-03
+08-provisioners/08-03-local-exec-provisioner/local-exec-output-files/*.txt
+
+# CLI config
+.terraformrc
+terraform.rc
+
+# Nota: .terraform.lock.hcl SI se versiona (fija las versiones de providers para todo el equipo)

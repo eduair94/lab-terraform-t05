@@ -1,0 +1,169 @@
+# =============================================================================
+# 10 · GitOps para infraestructura (equivalente a HCP Terraform + VCS workflow)
+# -----------------------------------------------------------------------------
+#  Pull Request  -> fmt + validate + PLAN, y el plan se comenta en el PR  (= "speculative plan")
+#  Push a main   -> PLAN + APPLY, con aprobacion manual (environment)     (= "Confirm & Apply")
+#  Manual        -> Actions > Run workflow > destroy                     (= "Queue destroy plan")
+#
+# La "nube" es moto (AWS simulado) corriendo como service container.
+# Para AWS real: quitar el service "moto", borrar moto_override.tf y usar
+# secrets.AWS_ACCESS_KEY_ID / secrets.AWS_SECRET_ACCESS_KEY (o mejor, OIDC).
+# =============================================================================
+name: "10 · GitOps Terraform"
+
+on:
+  pull_request:
+    paths:
+      - "10-gitops-github-actions/terraform-manifests/**"
+      - ".github/workflows/10-gitops.yml"
+  push:
+    branches: [main]
+    paths:
+      - "10-gitops-github-actions/terraform-manifests/**"
+      - ".github/workflows/10-gitops.yml"
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Que ejecutar"
+        type: choice
+        options: [plan, apply, destroy]
+        default: plan
+
+permissions:
+  contents: read
+  pull-requests: write # para comentar el plan en el PR
+
+# Un solo run a la vez sobre este "workspace" (= state locking a nivel pipeline)
+concurrency:
+  group: terraform-10-gitops
+  cancel-in-progress: false
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  # = HCP Terraform > Workspace > Variables > "Terraform variables"
+  TF_VAR_aws_region: us-east-1
+  TF_VAR_instance_type: t3.micro
+  # = HCP Terraform > Variables > "Environment variables" (sensitive).
+  # Con moto son valores falsos. En AWS real: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_ACCESS_KEY_ID: testing
+  AWS_SECRET_ACCESS_KEY: testing
+  WORKDIR: 10-gitops-github-actions/terraform-manifests
+
+jobs:
+  plan:
+    name: "Plan"
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.action == 'plan')
+    runs-on: ubuntu-latest
+    services:
+      moto:
+        image: motoserver/moto:5.2.4
+        ports: ["5000:5000"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.6
+          terraform_wrapper: false
+
+      # moto arranca vacio en cada run. Para que el plan muestre el DIFF real del PR
+      # (y no "crear todo"), primero aplicamos la version de la rama base:
+      # eso simula el "estado actual" que en HCP Terraform viviria en el workspace.
+      - name: Simular la infraestructura actual (aplicar rama base)
+        if: github.event_name == 'pull_request'
+        run: |
+          git worktree add /tmp/base "${{ github.event.pull_request.base.sha }}"
+          if [ -d "/tmp/base/$WORKDIR" ]; then
+            cd "/tmp/base/$WORKDIR"
+            terraform init -no-color
+            terraform apply -auto-approve -no-color
+            cp terraform.tfstate "$GITHUB_WORKSPACE/$WORKDIR/"
+          else
+            echo "La rama base no tiene $WORKDIR: el plan partira de cero."
+          fi
+
+      - name: terraform fmt -check
+        working-directory: ${{ env.WORKDIR }}
+        run: terraform fmt -check -diff
+
+      - name: terraform init
+        working-directory: ${{ env.WORKDIR }}
+        run: terraform init -no-color
+
+      - name: terraform validate
+        working-directory: ${{ env.WORKDIR }}
+        run: terraform validate -no-color
+
+      - name: terraform plan
+        working-directory: ${{ env.WORKDIR }}
+        run: |
+          terraform plan -no-color -out=tfplan | tee plan.txt
+          {
+            echo '### 📋 Terraform Plan'
+            echo '```'
+            grep -E '^  # |^Plan:|^No changes' plan.txt || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comentar el plan en el PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync(`${process.env.WORKDIR}/plan.txt`, 'utf8');
+            const summary = plan.split('\n').filter(l => /^  # |^Plan:|^No changes/.test(l)).join('\n');
+            const full = plan.length > 60000 ? plan.slice(-60000) : plan;
+            const body = [
+              '### 📋 Terraform Plan · `10-gitops-github-actions`',
+              '```diff', summary, '```',
+              '<details><summary>Plan completo</summary>', '', '```', full, '```', '</details>',
+              '',
+              '_Al hacer merge a `main`, el job **Apply** queda esperando aprobación (= "Confirm & Apply" de HCP Terraform)._'
+            ].join('\n');
+            await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
+
+  apply:
+    name: "Apply"
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.action != 'plan')
+    runs-on: ubuntu-latest
+    # Environment con "Required reviewers" -> alguien tiene que aprobar antes del apply
+    environment: lab-moto
+    services:
+      moto:
+        image: motoserver/moto:5.2.4
+        ports: ["5000:5000"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.6
+          terraform_wrapper: false
+
+      - name: terraform init
+        working-directory: ${{ env.WORKDIR }}
+        run: terraform init -no-color
+
+      - name: terraform apply
+        if: inputs.action != 'destroy'
+        working-directory: ${{ env.WORKDIR }}
+        run: |
+          terraform plan -no-color -out=tfplan
+          terraform apply -no-color tfplan
+          {
+            echo '### ✅ Apply'
+            echo '```'
+            terraform output -no-color
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: terraform destroy
+        if: inputs.action == 'destroy'
+        working-directory: ${{ env.WORKDIR }}
+        run: |
+          terraform apply -auto-approve -no-color   # moto esta vacio: primero creamos...
+          terraform destroy -auto-approve -no-color # ...y despues mostramos el destroy

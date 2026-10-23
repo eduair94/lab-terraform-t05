@@ -1,0 +1,47 @@
+# CI de todo el repo: formato + validate de cada lab + smoke test (apply/destroy) contra moto.
+name: "CI · Terraform labs"
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: "fmt + validate"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.6
+          terraform_wrapper: false
+      - name: terraform fmt -check -recursive
+        run: terraform fmt -check -recursive -diff
+      - name: terraform validate (cada lab)
+        run: bash scripts/test-all.sh validate
+
+  smoke:
+    name: "apply + destroy (moto + docker)"
+    needs: validate
+    runs-on: ubuntu-latest
+    services:
+      moto:
+        image: motoserver/moto:5.2.4
+        ports: ["5000:5000"]
+    env:
+      AWS_ACCESS_KEY_ID: testing
+      AWS_SECRET_ACCESS_KEY: testing
+      AWS_DEFAULT_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.6
+          terraform_wrapper: false
+      - name: Ejecutar todos los labs
+        run: bash scripts/test-all.sh apply
